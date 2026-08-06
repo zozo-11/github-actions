@@ -1,1 +1,257 @@
+name: Compiler un IPA non signé
 
+on:
+  workflow_call:
+    inputs:
+      ipa_name:
+        description: "Nom du fichier IPA"
+        required: false
+        type: string
+        default: "Application"
+
+      node_version:
+        description: "Version de Node.js"
+        required: false
+        type: string
+        default: "22"
+
+      scheme:
+        description: "Scheme Xcode à utiliser, vide pour détection automatique"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CI: "true"
+
+jobs:
+  build-ios:
+    name: Compiler l’application iOS
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Télécharger le projet
+        uses: actions/checkout@v4
+
+      - name: Installer Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Vérifier le projet
+        shell: bash
+        run: |
+          set -e
+
+          if [ ! -f "package.json" ]; then
+            echo "Erreur : package.json est introuvable à la racine du projet."
+            exit 1
+          fi
+
+          if ! grep -q '"expo"' package.json; then
+            echo "Attention : le paquet Expo ne semble pas être déclaré dans package.json."
+          fi
+
+      - name: Installer les dépendances JavaScript
+        shell: bash
+        run: |
+          set -e
+
+          if [ -f "pnpm-lock.yaml" ]; then
+            echo "Gestionnaire détecté : pnpm"
+            corepack enable
+            pnpm install --frozen-lockfile
+
+          elif [ -f "yarn.lock" ]; then
+            echo "Gestionnaire détecté : Yarn"
+            corepack enable
+
+            yarn install --immutable || \
+            yarn install --frozen-lockfile
+
+          elif [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
+            echo "Gestionnaire détecté : npm"
+            npm ci
+
+          else
+            echo "Aucun fichier de verrouillage détecté."
+            echo "Installation avec npm install."
+            npm install
+          fi
+
+      - name: Générer le projet iOS natif
+        shell: bash
+        run: |
+          set -e
+          npx expo prebuild --platform ios --clean
+
+      - name: Installer les dépendances CocoaPods
+        shell: bash
+        run: |
+          set -e
+
+          if [ ! -d "ios" ]; then
+            echo "Erreur : le dossier ios n’a pas été généré."
+            exit 1
+          fi
+
+          cd ios
+          pod install --repo-update
+
+      - name: Détecter le projet et le scheme Xcode
+        shell: bash
+        env:
+          REQUESTED_SCHEME: ${{ inputs.scheme }}
+        run: |
+          set -e
+
+          WORKSPACE="$(find ios -maxdepth 1 -type d -name '*.xcworkspace' -print -quit)"
+          PROJECT="$(find ios -maxdepth 1 -type d -name '*.xcodeproj' -print -quit)"
+
+          if [ -n "$WORKSPACE" ]; then
+            CONTAINER_FLAG="-workspace"
+            CONTAINER="$WORKSPACE"
+            ROOT_KEY="workspace"
+
+          elif [ -n "$PROJECT" ]; then
+            CONTAINER_FLAG="-project"
+            CONTAINER="$PROJECT"
+            ROOT_KEY="project"
+
+          else
+            echo "Erreur : aucun fichier .xcworkspace ou .xcodeproj trouvé."
+            exit 1
+          fi
+
+          SCHEME="$REQUESTED_SCHEME"
+
+          if [ -z "$SCHEME" ]; then
+            xcodebuild \
+              -list \
+              -json \
+              "$CONTAINER_FLAG" "$CONTAINER" \
+              > /tmp/xcode-project.json
+
+            SCHEME="$(python3 - "$ROOT_KEY" <<'PY'
+          import json
+          import sys
+
+          root_key = sys.argv[1]
+
+          with open("/tmp/xcode-project.json", "r", encoding="utf-8") as file:
+              data = json.load(file)
+
+          root = data.get(root_key, {})
+          schemes = root.get("schemes", [])
+
+          if not schemes:
+              raise SystemExit("Aucun scheme Xcode détecté.")
+
+          print(schemes[0])
+          PY
+            )"
+          fi
+
+          echo "Conteneur Xcode : $CONTAINER"
+          echo "Scheme Xcode : $SCHEME"
+
+          echo "XCODE_CONTAINER_FLAG=$CONTAINER_FLAG" >> "$GITHUB_ENV"
+          echo "XCODE_CONTAINER=$CONTAINER" >> "$GITHUB_ENV"
+          echo "XCODE_SCHEME=$SCHEME" >> "$GITHUB_ENV"
+
+      - name: Compiler sans signature Apple
+        shell: bash
+        run: |
+          set -e
+          set -o pipefail
+
+          rm -rf "$GITHUB_WORKSPACE/build"
+
+          xcodebuild \
+            "$XCODE_CONTAINER_FLAG" "$XCODE_CONTAINER" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            clean build \
+            | tee "$GITHUB_WORKSPACE/xcodebuild.log"
+
+      - name: Créer le fichier IPA
+        shell: bash
+        env:
+          REQUESTED_IPA_NAME: ${{ inputs.ipa_name }}
+        run: |
+          set -e
+
+          PRODUCTS_PATH="$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos"
+
+          APP_PATH="$(
+            find "$PRODUCTS_PATH" \
+              -maxdepth 2 \
+              -type d \
+              -name '*.app' \
+              -print \
+              -quit
+          )"
+
+          if [ -z "$APP_PATH" ]; then
+            echo "Erreur : aucun fichier .app n’a été trouvé."
+            find "$GITHUB_WORKSPACE/build" -maxdepth 6 -print || true
+            exit 1
+          fi
+
+          SAFE_NAME="$(
+            printf '%s' "$REQUESTED_IPA_NAME" \
+              | tr ' ' '-' \
+              | tr -cd 'A-Za-z0-9._-'
+          )"
+
+          if [ -z "$SAFE_NAME" ]; then
+            SAFE_NAME="Application"
+          fi
+
+          cd "$GITHUB_WORKSPACE"
+
+          rm -rf Payload
+          rm -f ./*.ipa
+
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+
+          ditto \
+            -c \
+            -k \
+            --sequesterRsrc \
+            --keepParent \
+            Payload \
+            "$SAFE_NAME-unsigned.ipa"
+
+          echo "IPA créé : $SAFE_NAME-unsigned.ipa"
+          ls -lh "$SAFE_NAME-unsigned.ipa"
+
+      - name: Publier le fichier IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.ipa_name }}-IPA-non-signe
+          path: ./*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publier le journal Xcode en cas d’erreur
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: journal-xcode
+          path: xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
