@@ -1,0 +1,282 @@
+name: Publier Archipel sur TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      marketing_version:
+        description: Version publique de l'application
+        required: true
+        default: "0.3.0"
+        type: string
+      build_number:
+        description: Numéro de build App Store Connect
+        required: true
+        default: "3"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: archipel-testflight
+  cancel-in-progress: false
+
+env:
+  APP_NAME: Archipel-des-Audacieux
+  TARGET_BUNDLE_ID: Archipel-des-Audacieux
+  UNSIGNED_IPA_URL: https://raw.githubusercontent.com/zozo-11/github-actions/b7192072c0092aaa220fae48ffa0d65bc68d3989/downloads/Archipel-des-Audacieux-0.3.0-unsigned.ipa
+  UNSIGNED_IPA_SHA256: eafea6127dbeac433081b6a5fb893d07e71bef6044bc9dc187a8ec01c222c132
+
+jobs:
+  sign-and-upload:
+    name: Signer et envoyer vers TestFlight
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    env:
+      P12_BASE64: ${{ secrets.ARCHIPEL_P12_BASE64 }}
+      P12_PASSWORD: ${{ secrets.ARCHIPEL_P12_PASSWORD }}
+      PROFILE_BASE64: ${{ secrets.ARCHIPEL_PROFILE_BASE64 }}
+      ASC_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      MARKETING_VERSION: ${{ inputs.marketing_version }}
+      BUILD_NUMBER: ${{ inputs.build_number }}
+
+    steps:
+      - name: Vérifier les entrées et les secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for value in \
+            "$P12_BASE64" \
+            "$P12_PASSWORD" \
+            "$PROFILE_BASE64" \
+            "$ASC_KEY_BASE64" \
+            "$ASC_KEY_ID" \
+            "$ASC_ISSUER_ID" \
+            "$APPLE_TEAM_ID"
+          do
+            test -n "$value" || { echo "Un secret de publication est absent."; exit 1; }
+          done
+
+          case "$BUILD_NUMBER" in
+            ''|*[!0-9]*) echo "Le numéro de build doit être numérique."; exit 1 ;;
+          esac
+
+          [[ "$MARKETING_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "La version doit respecter le format X.Y.Z."
+            exit 1
+          }
+
+      - name: Télécharger et vérifier l'IPA non signé
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl \
+            --fail \
+            --location \
+            --retry 4 \
+            --retry-all-errors \
+            --output "$RUNNER_TEMP/Archipel-unsigned.ipa" \
+            "$UNSIGNED_IPA_URL"
+
+          printf '%s  %s\n' \
+            "$UNSIGNED_IPA_SHA256" \
+            "$RUNNER_TEMP/Archipel-unsigned.ipa" \
+            | shasum -a 256 --check
+
+      - name: Installer le certificat et le profil Apple
+        id: signing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CERTIFICATE_PATH="$RUNNER_TEMP/Archipel-Distribution.p12"
+          PROFILE_PATH="$RUNNER_TEMP/Archipel-TestFlight.mobileprovision"
+          PROFILE_PLIST="$RUNNER_TEMP/Archipel-TestFlight.plist"
+          KEYCHAIN_PATH="$RUNNER_TEMP/Archipel.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          printf '%s' "$P12_BASE64" | /usr/bin/base64 -D > "$CERTIFICATE_PATH"
+          printf '%s' "$PROFILE_BASE64" | /usr/bin/base64 -D > "$PROFILE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -P "$P12_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+
+          security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
+          PROFILE_UUID="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST")"
+          PROFILE_TEAM="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$PROFILE_PLIST")"
+          PROFILE_APP_ID="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PROFILE_PLIST")"
+
+          test "$PROFILE_TEAM" = "$APPLE_TEAM_ID" || {
+            echo "Le profil appartient à une autre équipe Apple."
+            exit 1
+          }
+          test "$PROFILE_APP_ID" = "$APPLE_TEAM_ID.$TARGET_BUNDLE_ID" || {
+            echo "Le profil ne correspond pas au Bundle ID attendu."
+            exit 1
+          }
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+
+          SIGNING_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | awk '/Apple Distribution|iPhone Distribution/{print $2; exit}')"
+          test -n "$SIGNING_IDENTITY" || {
+            echo "Aucune identité Apple Distribution n'a été trouvée."
+            exit 1
+          }
+
+          echo "keychain_path=$KEYCHAIN_PATH" >> "$GITHUB_OUTPUT"
+          echo "profile_path=$PROFILE_PATH" >> "$GITHUB_OUTPUT"
+          echo "profile_plist=$PROFILE_PLIST" >> "$GITHUB_OUTPUT"
+          echo "profile_uuid=$PROFILE_UUID" >> "$GITHUB_OUTPUT"
+          echo "signing_identity=$SIGNING_IDENTITY" >> "$GITHUB_OUTPUT"
+
+      - name: Reconditionner et signer l'application Unity
+        id: package
+        shell: bash
+        env:
+          PROFILE_PATH: ${{ steps.signing.outputs.profile_path }}
+          PROFILE_PLIST: ${{ steps.signing.outputs.profile_plist }}
+          SIGNING_IDENTITY: ${{ steps.signing.outputs.signing_identity }}
+        run: |
+          set -euo pipefail
+
+          WORK_DIR="$RUNNER_TEMP/resign"
+          ENTITLEMENTS_PATH="$RUNNER_TEMP/Archipel.entitlements"
+          SIGNED_IPA="$RUNNER_TEMP/$APP_NAME-$MARKETING_VERSION-$BUILD_NUMBER-TestFlight.ipa"
+
+          rm -rf "$WORK_DIR"
+          mkdir -p "$WORK_DIR"
+          ditto -x -k "$RUNNER_TEMP/Archipel-unsigned.ipa" "$WORK_DIR"
+
+          APP_PATH="$(find "$WORK_DIR/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$APP_PATH" || { echo "Bundle .app introuvable."; exit 1; }
+
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $TARGET_BUNDLE_ID" "$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $MARKETING_VERSION" "$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Delete :ITSAppUsesNonExemptEncryption' "$APP_PATH/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c 'Add :ITSAppUsesNonExemptEncryption bool false' "$APP_PATH/Info.plist"
+
+          rm -rf "$APP_PATH/_CodeSignature"
+          find "$APP_PATH" -name '_CodeSignature' -type d -prune -exec rm -rf {} +
+          cp "$PROFILE_PATH" "$APP_PATH/embedded.mobileprovision"
+          xattr -cr "$APP_PATH"
+
+          plutil -extract Entitlements xml1 -o "$ENTITLEMENTS_PATH" "$PROFILE_PLIST"
+
+          if [ -d "$APP_PATH/Frameworks" ]; then
+            while IFS= read -r -d '' item; do
+              codesign \
+                --force \
+                --sign "$SIGNING_IDENTITY" \
+                --timestamp=none \
+                --generate-entitlement-der \
+                "$item"
+            done < <(find "$APP_PATH/Frameworks" -depth \
+              \( -type d -name '*.framework' -o -type f -name '*.dylib' \) \
+              -print0)
+          fi
+
+          if [ -d "$APP_PATH/PlugIns" ]; then
+            while IFS= read -r -d '' extension; do
+              codesign \
+                --force \
+                --sign "$SIGNING_IDENTITY" \
+                --timestamp=none \
+                --generate-entitlement-der \
+                "$extension"
+            done < <(find "$APP_PATH/PlugIns" -depth -type d -name '*.appex' -print0)
+          fi
+
+          codesign \
+            --force \
+            --sign "$SIGNING_IDENTITY" \
+            --entitlements "$ENTITLEMENTS_PATH" \
+            --timestamp=none \
+            --generate-entitlement-der \
+            "$APP_PATH"
+
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")" = "$TARGET_BUNDLE_ID"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Info.plist")" = "$BUILD_NUMBER"
+
+          cd "$WORK_DIR"
+          ditto -c -k --sequesterRsrc --keepParent Payload "$SIGNED_IPA"
+          echo "signed_ipa=$SIGNED_IPA" >> "$GITHUB_OUTPUT"
+
+      - name: Installer la clé App Store Connect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          API_KEYS_DIR="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$API_KEYS_DIR"
+          printf '%s' "$ASC_KEY_BASE64" \
+            | /usr/bin/base64 -D \
+            > "$API_KEYS_DIR/AuthKey_$ASC_KEY_ID.p8"
+          chmod 600 "$API_KEYS_DIR/AuthKey_$ASC_KEY_ID.p8"
+
+      - name: Envoyer le build vers TestFlight
+        shell: bash
+        env:
+          SIGNED_IPA: ${{ steps.package.outputs.signed_ipa }}
+        run: |
+          set -euo pipefail
+          set -o pipefail
+
+          xcrun altool \
+            --upload-app \
+            --type ios \
+            --file "$SIGNED_IPA" \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID" \
+            2>&1 | tee "$RUNNER_TEMP/testflight-upload.log"
+
+      - name: Conserver l'IPA signé et le journal
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Archipel-${{ inputs.marketing_version }}-${{ inputs.build_number }}-TestFlight
+          path: |
+            ${{ steps.package.outputs.signed_ipa }}
+            ${{ runner.temp }}/testflight-upload.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Nettoyer les éléments de signature
+        if: always()
+        shell: bash
+        env:
+          KEYCHAIN_PATH: ${{ steps.signing.outputs.keychain_path }}
+          PROFILE_UUID: ${{ steps.signing.outputs.profile_uuid }}
+        run: |
+          set +e
+          if [ -n "$KEYCHAIN_PATH" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi
+          rm -rf "$HOME/.appstoreconnect/private_keys"
+          if [ -n "$PROFILE_UUID" ]; then
+            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          fi
