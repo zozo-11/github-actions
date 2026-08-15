@@ -1,4 +1,4 @@
-name: Publier Archipel sur TestFlight
+name: Publier Archipel V2 sur TestFlight
 
 on:
   workflow_dispatch:
@@ -6,16 +6,16 @@ on:
       marketing_version:
         description: Version publique de l'application
         required: true
-        default: "0.3.0"
+        default: "0.4.0"
         type: string
       build_number:
         description: Numéro de build App Store Connect
         required: true
-        default: "3"
+        default: "4"
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: archipel-testflight
@@ -24,14 +24,15 @@ concurrency:
 env:
   APP_NAME: Archipel-des-Audacieux
   TARGET_BUNDLE_ID: Archipel-des-Audacieux
-  UNSIGNED_IPA_URL: https://raw.githubusercontent.com/zozo-11/github-actions/b7192072c0092aaa220fae48ffa0d65bc68d3989/downloads/Archipel-des-Audacieux-0.3.0-unsigned.ipa
-  UNSIGNED_IPA_SHA256: eafea6127dbeac433081b6a5fb893d07e71bef6044bc9dc187a8ec01c222c132
+  XCODE_EXPORT_URL: https://github.com/zozo-11/github-actions/releases/download/xcode-v0.4.0-build4/Archipel-Xcode-0.4.0-4.zip
+  XCODE_EXPORT_SHA256: 56df519c664ac1edab7143cddfe02c00ad266201ac5ad8db36338427efdd0015
+  RELEASE_TAG: xcode-v0.4.0-build4
 
 jobs:
-  sign-and-upload:
-    name: Signer et envoyer vers TestFlight
+  build-sign-upload:
+    name: Compiler, signer et envoyer vers TestFlight
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     env:
       P12_BASE64: ${{ secrets.ARCHIPEL_P12_BASE64 }}
@@ -65,29 +66,24 @@ jobs:
           case "$BUILD_NUMBER" in
             ''|*[!0-9]*) echo "Le numéro de build doit être numérique."; exit 1 ;;
           esac
-
           [[ "$MARKETING_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
             echo "La version doit respecter le format X.Y.Z."
             exit 1
           }
 
-      - name: Télécharger et vérifier l'IPA non signé
+      - name: Télécharger et vérifier le projet Xcode V2
         shell: bash
         run: |
           set -euo pipefail
 
-          curl \
-            --fail \
-            --location \
-            --retry 4 \
-            --retry-all-errors \
-            --output "$RUNNER_TEMP/Archipel-unsigned.ipa" \
-            "$UNSIGNED_IPA_URL"
-
-          printf '%s  %s\n' \
-            "$UNSIGNED_IPA_SHA256" \
-            "$RUNNER_TEMP/Archipel-unsigned.ipa" \
+          curl --fail --location --retry 4 --retry-all-errors \
+            --output "$RUNNER_TEMP/Archipel-Xcode.zip" \
+            "$XCODE_EXPORT_URL"
+          printf '%s  %s\n' "$XCODE_EXPORT_SHA256" "$RUNNER_TEMP/Archipel-Xcode.zip" \
             | shasum -a 256 --check
+          ditto -x -k "$RUNNER_TEMP/Archipel-Xcode.zip" "$RUNNER_TEMP/xcode"
+          test -f "$RUNNER_TEMP/xcode/XcodeProject/Unity-iPhone.xcodeproj/project.pbxproj"
+          test -f "$RUNNER_TEMP/xcode/XcodeProject/Info.plist"
 
       - name: Installer le certificat et le profil Apple
         id: signing
@@ -108,51 +104,62 @@ jobs:
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$CERTIFICATE_PATH" \
-            -P "$P12_PASSWORD" \
-            -A \
-            -t cert \
-            -f pkcs12 \
-            -k "$KEYCHAIN_PATH"
-          security set-key-partition-list \
-            -S apple-tool:,apple: \
-            -s \
-            -k "$KEYCHAIN_PASSWORD" \
-            "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH"
           security default-keychain -d user -s "$KEYCHAIN_PATH"
 
           security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
-          PROFILE_UUID="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST")"
           PROFILE_TEAM="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$PROFILE_PLIST")"
           PROFILE_APP_ID="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PROFILE_PLIST")"
 
-          test "$PROFILE_TEAM" = "$APPLE_TEAM_ID" || {
-            echo "Le profil appartient à une autre équipe Apple."
-            exit 1
-          }
+          test "$PROFILE_TEAM" = "$APPLE_TEAM_ID" || { echo "Le profil appartient à une autre équipe Apple."; exit 1; }
           test "$PROFILE_APP_ID" = "$APPLE_TEAM_ID.$TARGET_BUNDLE_ID" || {
             echo "Le profil ne correspond pas au Bundle ID attendu."
             exit 1
           }
 
-          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
-          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
-
           SIGNING_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
             | awk '/Apple Distribution|iPhone Distribution/{print $2; exit}')"
-          test -n "$SIGNING_IDENTITY" || {
-            echo "Aucune identité Apple Distribution n'a été trouvée."
-            exit 1
-          }
+          test -n "$SIGNING_IDENTITY" || { echo "Identité Apple Distribution introuvable."; exit 1; }
 
           echo "keychain_path=$KEYCHAIN_PATH" >> "$GITHUB_OUTPUT"
           echo "profile_path=$PROFILE_PATH" >> "$GITHUB_OUTPUT"
           echo "profile_plist=$PROFILE_PLIST" >> "$GITHUB_OUTPUT"
-          echo "profile_uuid=$PROFILE_UUID" >> "$GITHUB_OUTPUT"
           echo "signing_identity=$SIGNING_IDENTITY" >> "$GITHUB_OUTPUT"
 
-      - name: Reconditionner et signer l'application Unity
+      - name: Compiler le projet Unity avec Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR="$RUNNER_TEMP/xcode/XcodeProject"
+          INFO_PLIST="$PROJECT_DIR/Info.plist"
+          ARCHIVE_PATH="$RUNNER_TEMP/Archipel.xcarchive"
+
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $MARKETING_VERSION" "$INFO_PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$INFO_PLIST"
+          /usr/libexec/PlistBuddy -c 'Delete :ITSAppUsesNonExemptEncryption' "$INFO_PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c 'Add :ITSAppUsesNonExemptEncryption bool false' "$INFO_PLIST"
+
+          xcodebuild -version
+          cd "$PROJECT_DIR"
+          xcodebuild \
+            -project Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            archive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            | tee "$RUNNER_TEMP/xcode-build.log"
+
+          test -d "$ARCHIVE_PATH/Products/Applications"
+
+      - name: Signer et empaqueter l'IPA de distribution
         id: package
         shell: bash
         env:
@@ -162,16 +169,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          WORK_DIR="$RUNNER_TEMP/resign"
+          WORK_DIR="$RUNNER_TEMP/package"
           ENTITLEMENTS_PATH="$RUNNER_TEMP/Archipel.entitlements"
           SIGNED_IPA="$RUNNER_TEMP/$APP_NAME-$MARKETING_VERSION-$BUILD_NUMBER-TestFlight.ipa"
+          ARCHIVED_APP="$(find "$RUNNER_TEMP/Archipel.xcarchive/Products/Applications" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$ARCHIVED_APP" || { echo "Application Xcode compilée introuvable."; exit 1; }
 
-          rm -rf "$WORK_DIR"
-          mkdir -p "$WORK_DIR"
-          ditto -x -k "$RUNNER_TEMP/Archipel-unsigned.ipa" "$WORK_DIR"
-
-          APP_PATH="$(find "$WORK_DIR/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
-          test -n "$APP_PATH" || { echo "Bundle .app introuvable."; exit 1; }
+          mkdir -p "$WORK_DIR/Payload"
+          ditto "$ARCHIVED_APP" "$WORK_DIR/Payload/$APP_NAME.app"
+          APP_PATH="$WORK_DIR/Payload/$APP_NAME.app"
 
           /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $TARGET_BUNDLE_ID" "$APP_PATH/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $MARKETING_VERSION" "$APP_PATH/Info.plist"
@@ -180,39 +186,24 @@ jobs:
           /usr/libexec/PlistBuddy -c 'Add :ITSAppUsesNonExemptEncryption bool false' "$APP_PATH/Info.plist"
 
           rm -rf "$APP_PATH/_CodeSignature"
-          find "$APP_PATH" -name '_CodeSignature' -type d -prune -exec rm -rf {} +
           cp "$PROFILE_PATH" "$APP_PATH/embedded.mobileprovision"
           xattr -cr "$APP_PATH"
-
           plutil -extract Entitlements xml1 -o "$ENTITLEMENTS_PATH" "$PROFILE_PLIST"
 
           if [ -d "$APP_PATH/Frameworks" ]; then
             while IFS= read -r -d '' item; do
-              codesign \
-                --force \
-                --sign "$SIGNING_IDENTITY" \
-                --timestamp=none \
-                --generate-entitlement-der \
-                "$item"
+              codesign --force --sign "$SIGNING_IDENTITY" --timestamp=none --generate-entitlement-der "$item"
             done < <(find "$APP_PATH/Frameworks" -depth \
-              \( -type d -name '*.framework' -o -type f -name '*.dylib' \) \
-              -print0)
+              \( -type d -name '*.framework' -o -type f -name '*.dylib' \) -print0)
           fi
 
           if [ -d "$APP_PATH/PlugIns" ]; then
             while IFS= read -r -d '' extension; do
-              codesign \
-                --force \
-                --sign "$SIGNING_IDENTITY" \
-                --timestamp=none \
-                --generate-entitlement-der \
-                "$extension"
+              codesign --force --sign "$SIGNING_IDENTITY" --timestamp=none --generate-entitlement-der "$extension"
             done < <(find "$APP_PATH/PlugIns" -depth -type d -name '*.appex' -print0)
           fi
 
-          codesign \
-            --force \
-            --sign "$SIGNING_IDENTITY" \
+          codesign --force --sign "$SIGNING_IDENTITY" \
             --entitlements "$ENTITLEMENTS_PATH" \
             --timestamp=none \
             --generate-entitlement-der \
@@ -221,9 +212,12 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")" = "$TARGET_BUNDLE_ID"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Info.plist")" = "$BUILD_NUMBER"
+          EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
+          lipo -info "$APP_PATH/$EXECUTABLE_NAME" | grep -q 'arm64'
 
           cd "$WORK_DIR"
           ditto -c -k --sequesterRsrc --keepParent Payload "$SIGNED_IPA"
+          shasum -a 256 "$SIGNED_IPA" | tee "$RUNNER_TEMP/ipa-sha256.txt"
           echo "signed_ipa=$SIGNED_IPA" >> "$GITHUB_OUTPUT"
 
       - name: Installer la clé App Store Connect
@@ -233,9 +227,7 @@ jobs:
 
           API_KEYS_DIR="$HOME/.appstoreconnect/private_keys"
           mkdir -p "$API_KEYS_DIR"
-          printf '%s' "$ASC_KEY_BASE64" \
-            | /usr/bin/base64 -D \
-            > "$API_KEYS_DIR/AuthKey_$ASC_KEY_ID.p8"
+          printf '%s' "$ASC_KEY_BASE64" | /usr/bin/base64 -D > "$API_KEYS_DIR/AuthKey_$ASC_KEY_ID.p8"
           chmod 600 "$API_KEYS_DIR/AuthKey_$ASC_KEY_ID.p8"
 
       - name: Envoyer le build vers TestFlight
@@ -254,29 +246,39 @@ jobs:
             --apiIssuer "$ASC_ISSUER_ID" \
             2>&1 | tee "$RUNNER_TEMP/testflight-upload.log"
 
-      - name: Conserver l'IPA signé et le journal
+      - name: Publier aussi l'IPA comme lien web
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED_IPA: ${{ steps.package.outputs.signed_ipa }}
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" \
+            "$SIGNED_IPA#$APP_NAME-$MARKETING_VERSION-$BUILD_NUMBER-TestFlight.ipa" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Conserver l'IPA et les journaux
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Archipel-${{ inputs.marketing_version }}-${{ inputs.build_number }}-TestFlight
           path: |
             ${{ steps.package.outputs.signed_ipa }}
+            ${{ runner.temp }}/xcode-build.log
             ${{ runner.temp }}/testflight-upload.log
+            ${{ runner.temp }}/ipa-sha256.txt
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 14
 
       - name: Nettoyer les éléments de signature
         if: always()
         shell: bash
         env:
           KEYCHAIN_PATH: ${{ steps.signing.outputs.keychain_path }}
-          PROFILE_UUID: ${{ steps.signing.outputs.profile_uuid }}
         run: |
           set +e
           if [ -n "$KEYCHAIN_PATH" ] && [ -f "$KEYCHAIN_PATH" ]; then
             security delete-keychain "$KEYCHAIN_PATH"
           fi
           rm -rf "$HOME/.appstoreconnect/private_keys"
-          if [ -n "$PROFILE_UUID" ]; then
-            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
-          fi
